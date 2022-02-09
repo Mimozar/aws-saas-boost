@@ -28,7 +28,7 @@
         <!-- plugin versions -->
         <assembly.version>3.1.1</assembly.version>
         <checkstyle.version>3.1.2</checkstyle.version>
-        <compiler.version>3.8.1</compiler.version>
+        <compiler.version>3.8.4</compiler.version>
         <compiler.java.version>17</compiler.java.version>
         <spotbugs.version>4.3.0</spotbugs.version>
         <!-- TODO upgrade to surefire 3 on release? -->
