@@ -30,12 +30,14 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.cloudformation.CloudFormationClient;
 import software.amazon.awssdk.services.cloudformation.model.*;
 import software.amazon.awssdk.services.cloudformation.model.Stack;
+import software.amazon.awssdk.services.codepipeline.CodePipelineClient;
+import software.amazon.awssdk.services.codepipeline.model.ListTagsForResourceResponse;
+import software.amazon.awssdk.services.codepipeline.model.Tag;
 import software.amazon.awssdk.services.ecr.EcrClient;
 import software.amazon.awssdk.services.ecr.model.EcrException;
 import software.amazon.awssdk.services.ecr.model.ImageIdentifier;
 import software.amazon.awssdk.services.ecr.model.ListImagesResponse;
 import software.amazon.awssdk.services.elasticloadbalancingv2.ElasticLoadBalancingV2Client;
-import software.amazon.awssdk.services.elasticloadbalancingv2.model.*;
 import software.amazon.awssdk.services.eventbridge.EventBridgeClient;
 import software.amazon.awssdk.services.route53.Route53Client;
 import software.amazon.awssdk.services.route53.model.*;
@@ -51,7 +53,6 @@ import java.io.*;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Path;
 import java.time.Duration;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -60,6 +61,7 @@ public class OnboardingService {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(OnboardingService.class);
     private static final Map<String, String> CORS = Map.of("Access-Control-Allow-Origin", "*");
+    private static final String AWS_REGION = System.getenv("AWS_REGION");
     private static final String SYSTEM_API_CALL_DETAIL_TYPE = "System API Call";
     private static final String EVENT_SOURCE = "saas-boost";
     private static final String SAAS_BOOST_ENV = System.getenv("SAAS_BOOST_ENV");
@@ -84,6 +86,7 @@ public class OnboardingService {
     private final Route53Client route53;
     private final SqsClient sqs;
     private final ElasticLoadBalancingV2Client elb;
+    private final CodePipelineClient codePipeline;
 
     public OnboardingService() {
         LOGGER.info("Version Info: {}", Utils.version(this.getClass()));
@@ -107,6 +110,7 @@ public class OnboardingService {
         this.route53 = Utils.sdkClient(Route53Client.builder(), Route53Client.SERVICE_NAME);
         this.sqs = Utils.sdkClient(SqsClient.builder(), SqsClient.SERVICE_NAME);
         this.elb = Utils.sdkClient(ElasticLoadBalancingV2Client.builder(), ElasticLoadBalancingV2Client.SERVICE_NAME);
+        this.codePipeline = Utils.sdkClient(CodePipelineClient.builder(), CodePipelineClient.SERVICE_NAME);
     }
 
     /**
@@ -580,14 +584,16 @@ public class OnboardingService {
 
                 // Now run the onboarding stack to provision the infrastructure for this tenant
                 LOGGER.info("OnboardingService::provisionTenant create stack " + stackName);
+                String templateUrl = "https://" + SAAS_BOOST_BUCKET + ".s3." + AWS_REGION
+                        + ".amazonaws.com/tenant-onboarding.yaml";
                 String stackId;
                 try {
                     CreateStackResponse cfnResponse = cfn.createStack(CreateStackRequest.builder()
                             .stackName(stackName)
-                            .disableRollback(true) // This was set to DO_NOTHING to ease debugging of failed stacks. Maybe not appropriate for "production". If we change this we'll have to add a whole bunch of IAM delete permissions to the execution role.
+                            .disableRollback(false)
                             .capabilitiesWithStrings("CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND")
                             .notificationARNs(ONBOARDING_STACK_SNS)
-                            .templateURL("https://" + SAAS_BOOST_BUCKET + ".s3.amazonaws.com/tenant-onboarding.yaml")
+                            .templateURL(templateUrl)
                             .parameters(templateParameters)
                             .build()
                     );
@@ -707,6 +713,9 @@ public class OnboardingService {
     }
 
     protected void handleOnboardingBaseProvisioned(Map<String, Object> event, Context context) {
+        if (Utils.isBlank(AWS_REGION)) {
+            throw new IllegalStateException("Missing required environment variable AWS_REGION");
+        }
         if (Utils.isBlank(SAAS_BOOST_ENV)) {
             throw new IllegalStateException("Missing required environment variable SAAS_BOOST_ENV");
         }
@@ -745,6 +754,7 @@ public class OnboardingService {
                     String vpc;
                     String privateSubnetA;
                     String privateSubnetB;
+                    String privateRouteTable;
                     String ecsSecurityGroup;
                     String loadBalancerArn;
                     String httpListenerArn;
@@ -755,6 +765,7 @@ public class OnboardingService {
                         vpc = tenantResources.get("VPC").get("name");
                         privateSubnetA = tenantResources.get("PRIVATE_SUBNET_A").get("name");
                         privateSubnetB = tenantResources.get("PRIVATE_SUBNET_B").get("name");
+                        privateRouteTable = tenantResources.get("PRIVATE_ROUTE_TABLE").get("name");
                         ecsCluster = tenantResources.get("ECS_CLUSTER").get("name");
                         ecsSecurityGroup = tenantResources.get("ECS_SECURITY_GROUP").get("name");
                         loadBalancerArn = tenantResources.get("LOAD_BALANCER").get("arn");
@@ -835,8 +846,7 @@ public class OnboardingService {
 
                         Map<String, Object> tierConfig = (Map<String, Object>) tiers.get(tier);
                         String clusterInstanceType = (String) tierConfig.get("instanceType");
-                        // TODO Update App Config to capture what launch type to use
-                        String launchType = "LINUX".equals(clusterOS) ? "FARGATE" : "EC2";
+                        String launchType = (String) service.get("ecsLaunchType");
                         Integer taskMemory = (Integer) tierConfig.get("memory");
                         Integer taskCpu = (Integer) tierConfig.get("cpu");
                         Integer minCount = (Integer) tierConfig.get("min");
@@ -845,23 +855,23 @@ public class OnboardingService {
                         // Does this service use a shared filesystem?
                         Boolean enableEfs = Boolean.FALSE;
                         Boolean enableFSx = Boolean.FALSE;
-                        String mountPoint = "";
-                        Boolean encryptFilesystem = Boolean.FALSE;
+                        String mountPoint = "/mnt";
+                        Boolean encryptFilesystem = Boolean.TRUE;
                         String filesystemLifecycle = "NEVER";
-                        String fileSystemType = "";
-                        Integer fsxStorageGb = 0;
-                        Integer fsxThroughputMbs = 0;
-                        Integer fsxBackupRetentionDays = 7;
-                        String fsxDailyBackupTime = "";
-                        String fsxWeeklyMaintenanceTime = "";
-                        String fsxWindowsMountDrive = "";
+                        Integer fsxStorageGb = 32;
+                        Integer fsxThroughputMbs = 8;
+                        Integer fsxBackupRetentionDays = 0;
+                        String fsxDailyBackupTime = "02:00";
+                        String fsxWeeklyMaintenanceTime = "7:01:00";
+                        String fsxWindowsMountDrive = "G:";
+                        Integer ontapVolumeSize = 40;
+                        String fileSystemType = "FSX_WINDOWS";
                         Map<String, Object> filesystem = (Map<String, Object>) tierConfig.get("filesystem");
                         if (filesystem != null && !filesystem.isEmpty()) {
                             fileSystemType = (String) filesystem.get("type");
                             mountPoint = (String) filesystem.get("mountPoint");
                             if ("EFS".equals(fileSystemType)) {
                                 enableEfs = Boolean.TRUE;
-                                // Map<String, Object> efsConfig = (Map<String, Object>) filesystem.get("efs");
                                 encryptFilesystem = (Boolean) filesystem.get("encrypt");
                                 if (encryptFilesystem == null) {
                                     encryptFilesystem = Boolean.FALSE;
@@ -870,33 +880,41 @@ public class OnboardingService {
                                 if (filesystemLifecycle == null) {
                                     filesystemLifecycle = "NEVER";
                                 }
-                            } else if ("FSX_WINDOWS".equals(fileSystemType)) {
+                            } else if ("FSX_WINDOWS".equals(fileSystemType) || "FSX_ONTAP".equals(fileSystemType)) {
                                 enableFSx = Boolean.TRUE;
-                                // Map<String, Object> fsxConfig = (Map<String, Object>) filesystem.get("fsx");
-                                fsxStorageGb = (Integer) filesystem.get("storageGb"); // GB 32 to 65,536
+                                fsxStorageGb = (Integer) filesystem.get("storageGb");
                                 if (fsxStorageGb == null) {
-                                    fsxStorageGb = 0;
+                                    fsxStorageGb = "FSX_ONTAP".equals(fileSystemType) ? 1024 : 32;
                                 }
-                                fsxThroughputMbs = (Integer) filesystem.get("throughputMbs"); // MB/s
+                                fsxThroughputMbs = (Integer) filesystem.get("throughputMbs");
                                 if (fsxThroughputMbs == null) {
-                                    fsxThroughputMbs = 0;
+                                    fsxThroughputMbs = "FSX_ONTAP".equals(fileSystemType) ? 128 : 8;
                                 }
-                                fsxBackupRetentionDays = (Integer) filesystem.get("backupRetentionDays"); // 7 to 35
+                                fsxBackupRetentionDays = (Integer) filesystem.get("backupRetentionDays");
                                 if (fsxBackupRetentionDays == null) {
-                                    fsxBackupRetentionDays = 7;
+                                    fsxBackupRetentionDays = 0; // Turn off automated backups
                                 }
-                                fsxDailyBackupTime = (String) filesystem.get("dailyBackupTime"); //HH:MM in UTC
+                                fsxDailyBackupTime = (String) filesystem.get("dailyBackupTime");
                                 if (fsxDailyBackupTime == null) {
-                                    fsxDailyBackupTime = "";
+                                    fsxDailyBackupTime = "02:00"; // 2:00 AM
                                 }
-                                fsxWeeklyMaintenanceTime = (String) filesystem.get("weeklyMaintenanceTime");//d:HH:MM in UTC
+                                fsxWeeklyMaintenanceTime = (String) filesystem.get("weeklyMaintenanceTime");
                                 if (fsxWeeklyMaintenanceTime == null) {
-                                    fsxWeeklyMaintenanceTime = "";
+                                    fsxWeeklyMaintenanceTime = "7:01:00"; // Sun 1:00 AM
                                 }
                                 fsxWindowsMountDrive = (String) filesystem.get("windowsMountDrive");
                                 if (fsxWindowsMountDrive == null) {
-                                    fsxWindowsMountDrive = "";
+                                    fsxWindowsMountDrive = "G:";
                                 }
+                                if ("FSX_ONTAP".equals(fileSystemType)) {
+                                    ontapVolumeSize = (Integer) filesystem.get("volumeSize");
+                                    if (ontapVolumeSize == null) {
+                                        ontapVolumeSize = 40;
+                                    }
+                                }
+                            }
+                            if (enableEfs || fileSystemType == null) {
+                                fileSystemType = "FSX_WINDOWS";
                             }
                         }
 
@@ -941,7 +959,7 @@ public class OnboardingService {
                         templateParameters.add(Parameter.builder().parameterKey("VPC").parameterValue(vpc).build());
                         templateParameters.add(Parameter.builder().parameterKey("SubnetPrivateA").parameterValue(privateSubnetA).build());
                         templateParameters.add(Parameter.builder().parameterKey("SubnetPrivateB").parameterValue(privateSubnetB).build());
-                        templateParameters.add(Parameter.builder().parameterKey("ECSLoadBalancer").parameterValue(loadBalancerArn).build());
+                        templateParameters.add(Parameter.builder().parameterKey("PrivateRouteTable").parameterValue(privateRouteTable).build());
                         templateParameters.add(Parameter.builder().parameterKey("ECSLoadBalancerHttpListener").parameterValue(httpListenerArn).build());
                         templateParameters.add(Parameter.builder().parameterKey("ECSLoadBalancerHttpsListener").parameterValue(httpsListenerArn).build());
                         templateParameters.add(Parameter.builder().parameterKey("ECSSecurityGroup").parameterValue(ecsSecurityGroup).build());
@@ -955,16 +973,18 @@ public class OnboardingService {
                         templateParameters.add(Parameter.builder().parameterKey("ContainerPort").parameterValue(containerPort.toString()).build());
                         templateParameters.add(Parameter.builder().parameterKey("ContainerHealthCheckPath").parameterValue(healthCheck).build());
                         templateParameters.add(Parameter.builder().parameterKey("UseEFS").parameterValue(enableEfs.toString()).build());
-                        templateParameters.add(Parameter.builder().parameterKey("MountPoint").parameterValue(mountPoint).build());
+                        templateParameters.add(Parameter.builder().parameterKey("FileSystemMountPoint").parameterValue(mountPoint).build());
                         templateParameters.add(Parameter.builder().parameterKey("EncryptEFS").parameterValue(encryptFilesystem.toString()).build());
                         templateParameters.add(Parameter.builder().parameterKey("EFSLifecyclePolicy").parameterValue(filesystemLifecycle).build());
                         templateParameters.add(Parameter.builder().parameterKey("UseFSx").parameterValue(enableFSx.toString()).build());
+                        templateParameters.add(Parameter.builder().parameterKey("FSxFileSystemType").parameterValue(fileSystemType.toString()).build());
                         templateParameters.add(Parameter.builder().parameterKey("FSxWindowsMountDrive").parameterValue(fsxWindowsMountDrive).build());
                         templateParameters.add(Parameter.builder().parameterKey("FSxDailyBackupTime").parameterValue(fsxDailyBackupTime).build());
                         templateParameters.add(Parameter.builder().parameterKey("FSxBackupRetention").parameterValue(fsxBackupRetentionDays.toString()).build());
-                        templateParameters.add(Parameter.builder().parameterKey("FSxThroughputCapacity").parameterValue(fsxThroughputMbs.toString()).build());
-                        templateParameters.add(Parameter.builder().parameterKey("FSxStorageCapacity").parameterValue(fsxStorageGb.toString()).build());
+                        templateParameters.add(Parameter.builder().parameterKey("FileSystemThroughput").parameterValue(fsxThroughputMbs.toString()).build());
+                        templateParameters.add(Parameter.builder().parameterKey("FileSystemStorage").parameterValue(fsxStorageGb.toString()).build());
                         templateParameters.add(Parameter.builder().parameterKey("FSxWeeklyMaintenanceTime").parameterValue(fsxWeeklyMaintenanceTime).build());
+                        templateParameters.add(Parameter.builder().parameterKey("OntapVolumeSize").parameterValue(ontapVolumeSize.toString()).build());
                         templateParameters.add(Parameter.builder().parameterKey("UseRDS").parameterValue(enableDatabase.toString()).build());
                         templateParameters.add(Parameter.builder().parameterKey("RDSInstanceClass").parameterValue(dbInstanceClass).build());
                         templateParameters.add(Parameter.builder().parameterKey("RDSEngine").parameterValue(dbEngine).build());
@@ -978,8 +998,9 @@ public class OnboardingService {
                         // TODO rework these last 2?
                         templateParameters.add(Parameter.builder().parameterKey("MetricsStream").parameterValue("").build());
                         templateParameters.add(Parameter.builder().parameterKey("EventBus").parameterValue(SAAS_BOOST_EVENT_BUS).build());
+                        templateParameters.add(Parameter.builder().parameterKey("Tier").parameterValue(tier).build());
                         for (Parameter p : templateParameters) {
-                            //LOGGER.info("{} => {}", p.parameterKey(), p.parameterValue());
+                            LOGGER.info("{} => {}", p.parameterKey(), p.parameterValue());
                             if (p.parameterValue() == null) {
                                 LOGGER.error("OnboardingService::provisionTenant template parameter {} is NULL", p.parameterKey());
                                 dal.updateStatus(onboarding.getId(), OnboardingStatus.failed);
@@ -990,23 +1011,23 @@ public class OnboardingService {
 
                         // Make the stack name look like what CloudFormation would have done for a nested stack
                         String tenantShortId = tenantId.substring(0, 8);
-                        String stackName = "sb-" + SAAS_BOOST_ENV + "-tenant-" + tenantShortId + "-app-" + serviceResourceName
-                                + "-" + Utils.randomString(12).toUpperCase();
+                        String stackName = "sb-" + SAAS_BOOST_ENV + "-tenant-" + tenantShortId + "-app-"
+                                + serviceResourceName + "-" + Utils.randomString(12).toUpperCase();
                         if (stackName.length() > 128) {
                             stackName = stackName.substring(0, 128);
                         }
                         // Now run the onboarding stack to provision the infrastructure for this application service
                         LOGGER.info("OnboardingService::provisionApplication create stack " + stackName);
-
+                        String templateUrl = "https://" + SAAS_BOOST_BUCKET + ".s3." + AWS_REGION
+                                + ".amazonaws.com/tenant-onboarding-app.yaml";
                         String stackId;
                         try {
                             CreateStackResponse cfnResponse = cfn.createStack(CreateStackRequest.builder()
                                     .stackName(stackName)
-                                    .disableRollback(true) // For ease in debugging of failed stacks. Maybe not appropriate for "production".
-                                    //.timeoutInMinutes(60) // Some resources can take a really long time to light up. Do we want to specify this?
+                                    .disableRollback(false)
                                     .capabilitiesWithStrings("CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND")
                                     .notificationARNs(ONBOARDING_APP_STACK_SNS)
-                                    .templateURL("https://" + SAAS_BOOST_BUCKET + ".s3.amazonaws.com/tenant-onboarding-app.yaml")
+                                    .templateURL(templateUrl)
                                     .parameters(templateParameters)
                                     .build()
                             );
@@ -1126,19 +1147,17 @@ public class OnboardingService {
 
     protected void handleOnboardingDeploymentPipelineChanged(Map<String, Object> event, Context context) {
         if ("aws.codepipeline".equals(event.get("source"))) {
+            List<String> resources = (List<String>) event.get("resources");
             Map<String, Object> detail = (Map<String, Object>) event.get("detail");
             String pipeline = (String) detail.get("pipeline");
-            String prefix = "sb-" + SAAS_BOOST_ENV + "-tenant-";
-            if (pipeline != null && pipeline.startsWith(prefix)) {
-                // CodePipelines are named sb-${environment}-tenant-${tenantId prefix}-${service name}
-                // We can fetch the full tenantId from the Tags on the pipeline if this is too fragile
-                String tenantId;
-                try {
-                    tenantId = pipeline.split("-")[3];
-                } catch (IndexOutOfBoundsException iob) {
-                    LOGGER.error("Unexpected CodePipeline name pattern {}", pipeline);
-                    tenantId = pipeline.substring(prefix.length());
-                }
+            try {
+                String pipelineArn = resources.get(0);
+                LOGGER.info("Fetching tenant id from CodePipeline tags");
+                ListTagsForResourceResponse tagsResponse = codePipeline.listTagsForResource(request -> request
+                        .resourceArn(pipelineArn)
+                );
+                Tag tenantTag = tagsResponse.tags().stream().filter(t -> "Tenant".equals(t.key())).findFirst().get();
+                String tenantId = tenantTag.value();
                 Onboarding onboarding = dal.getOnboardingByTenantId(tenantId);
                 if (onboarding != null) {
                     tenantId = onboarding.getTenantId().toString();
@@ -1212,6 +1231,9 @@ public class OnboardingService {
                 } else {
                     LOGGER.error("Can't find onboarding record for tenant {}", tenantId);
                 }
+            } catch (Exception e) {
+                LOGGER.error("Error fetching tenant id from pipeline {}", pipeline);
+                LOGGER.error(Utils.getFullStackTrace(e));
             }
         }
     }

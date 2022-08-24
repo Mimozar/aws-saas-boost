@@ -356,6 +356,11 @@ Resources:
               - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/saas-boost/${Environment}/*
           - Effect: Allow
             Action:
+              - secretsmanager:GetSecretValue
+            Resource:
+              - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/saas-boost/${Environment}/*
+          - Effect: Allow
+            Action:
               - ssm:GetParameters
             Resource:
               - arn:aws:ssm:*:*:parameter/aws/service/ami-windows-latest/*
@@ -377,6 +382,9 @@ Resources:
               - codepipeline:GetPipeline
               - codepipeline:GetPipelineState
               - codepipeline:UpdatePipeline
+              - codepipeline:TagResource
+              - codepipeline:UntagResource
+              - codepipeline:ListTagsForResource
             Resource:
               - !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:sb-${Environment}-tenant*
           - Effect: Allow
@@ -458,6 +466,7 @@ Resources:
               - ec2:DeleteTags
             Resource:
               - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+              - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/*
               - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:internet-gateway/*
               - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc/*
               - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:route-table/*
@@ -467,6 +476,7 @@ Resources:
           - Effect: Allow
             Action:
               - ec2:CreateLaunchTemplate
+              - ec2:DeleteLaunchTemplate
             Resource:
               - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/*
           - Effect: Allow
@@ -548,6 +558,8 @@ Resources:
               - iam:GetRole
               - iam:CreateRole
               - iam:DeleteRole
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
               - iam:GetRolePolicy
               - iam:PutRolePolicy
               - iam:DeleteRolePolicy
@@ -731,14 +743,39 @@ Resources:
               - fsx:CreateFileSystem
               - fsx:DeleteFileSystem
               - fsx:TagResource
+              - fsx:UntagResource
             Resource:
               - !Sub arn:aws:fsx:${AWS::Region}:${AWS::AccountId}:file-system/*
+          - Effect: Allow
+            Action:
+              - fsx:CreateStorageVirtualMachine
+            Resource:
+              - !Sub arn:aws:fsx:${AWS::Region}:${AWS::AccountId}:storage-virtual-machine/*
+              - !Sub arn:aws:fsx:${AWS::Region}:${AWS::AccountId}:file-system/*
+          - Effect: Allow
+            Action:
+              - fsx:TagResource
+              - fsx:UntagResource
+              - fsx:DeleteStorageVirtualMachine
+            Resource:
+              - !Sub arn:aws:fsx:${AWS::Region}:${AWS::AccountId}:storage-virtual-machine/*
+          - Effect: Allow
+            Action:
+              - fsx:TagResource
+              - fsx:UntagResource
+              - fsx:CreateVolume
+              - fsx:DeleteVolume
+            Resource:
+              - !Sub arn:aws:fsx:${AWS::Region}:${AWS::AccountId}:volume/*/*
+              - !Sub arn:aws:fsx:${AWS::Region}:${AWS::AccountId}:storage-virtual-machine/*/*
           - Effect: Allow
             Action:
               - elasticfilesystem:CreateFileSystem
               - elasticfilesystem:DeleteFileSystem
               - ds:DescribeDirectories
               - fsx:DescribeFileSystems
+              - fsx:DescribeStorageVirtualMachines
+              - fsx:DescribeVolumes
             Resource:
               - '*'
           - Effect: Allow
@@ -758,6 +795,7 @@ Resources:
               - lambda:CreateFunction
               - lambda:InvokeFunction
               - lambda:DeleteFunction
+              - lambda:TagResource
             Resource:
               - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:sb-${Environment}-fsx-dns-tenant-*
           - Effect: Allow
