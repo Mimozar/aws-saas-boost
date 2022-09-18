@@ -34,7 +34,7 @@ limitations under the License.
     </licenses>
 
     <properties>
-        <checkstyle.maxAllowedViolations>105</checkstyle.maxAllowedViolations>
+        <checkstyle.maxAllowedViolations>82</checkstyle.maxAllowedViolations>
     </properties>
 
     <build>
@@ -108,6 +108,17 @@ limitations under the License.
     </build>
 
     <dependencies>
+        <dependency>
+            <groupId>com.amazon.aws.partners.saasfactory.saasboost</groupId>
+            <artifactId>Utils</artifactId>
+            <version>1.0.0</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>url-connection-client</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
         <dependency>
             <groupId>junit</groupId>
             <artifactId>junit</artifactId>
